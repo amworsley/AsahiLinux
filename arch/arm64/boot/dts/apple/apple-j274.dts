@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "apple-m1.dtsi"
+
+/ {
+	compatible = "apple,j274", "apple,m1", "apple,arm-platform";
+	model = "Apple Mac Mini M1 2020";
+
+	aliases {
+		serial0 = &serial0;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		stdout-path = "serial0:1500000";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by loader */
+			/* Format properties will be added by loader */
+			status = "disabled";
+		};
+	};
+
+	memory@800000000 {
+		device_type = "memory";
+		reg = <0 0 0 0>; /* To be filled by loader */
+	};
+};
+
+&serial0 {
+	status = "okay";
+};
