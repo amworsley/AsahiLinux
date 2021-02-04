@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/arm/apple.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple ARM Machine Device Tree Bindings
+
+maintainers:
+  - Hector Martin <marcan@marcan.st>
+
+description: |
+  Apple ARM ("Apple Silicon") platforms should contain compatible strings
+  in the following format:
+
+  - apple,j274 (board/device ID)
+  - apple,m1 (SoC name)
+  - apple,arm-platform (Apple Silicon)
+
+properties:
+  $nodename:
+    const: "/"
+  compatible:
+    oneOf:
+      - description: Apple M1 SoC based platforms
+        items:
+          - enum:
+              - apple,j274 # Mac mini (M1, 2020)
+              - apple,j293 # MacBook Pro (13-inch, M1, 2020)
+              - apple,j313 # MacBook Air (M1, 2020)
+          - const: apple,m1
+          - const: apple,arm-platform
+
+additionalProperties: true
+
+...
