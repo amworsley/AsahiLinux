@@ -1646,6 +1646,7 @@ B:	https://github.com/AsahiLinux/linux/issues
 C:	irc://chat.freenode.net/asahi-dev
 T:	git https://github.com/AsahiLinux/linux.git
 F:	Documentation/devicetree/bindings/arm/apple.yaml
+F:	Documentation/devicetree/bindings/interrupt-controller/apple,aic.yaml
 F:	arch/arm64/include/asm/sysreg_apple.h
 
 ARM/ARTPEC MACHINE SUPPORT
