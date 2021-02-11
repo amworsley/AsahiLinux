@@ -11,6 +11,7 @@
 #include <linux/blk-mq.h>
 #include <linux/blk-mq-pci.h>
 #include <linux/dmi.h>
+#include <linux/dmapool.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -19,6 +20,7 @@
 #include <linux/mutex.h>
 #include <linux/once.h>
 #include <linux/pci.h>
+#include <linux/platform_device.h>
 #include <linux/suspend.h>
 #include <linux/t10-pi.h>
 #include <linux/types.h>
@@ -185,7 +187,11 @@ static inline struct nvme_dev *to_nvme_dev(struct nvme_ctrl *ctrl)
 
 static inline struct pci_dev *nvme_pci_dev(struct nvme_dev *dev)
 {
-	return to_pci_dev(dev->dev);
+	if (IS_ENABLED(CONFIG_BLK_DEV_NVME) &&
+	    !(dev->ctrl.quirks & NVME_QUIRK_PLATFORM_DEVICE))
+		return to_pci_dev(dev->dev);
+
+	return NULL;
 }
 
 /*
@@ -2902,6 +2908,108 @@ static void nvme_remove(struct nvme_dev *dev)
 	nvme_release_prp_pools(dev);
 }
 
+#if IS_ENABLED(CONFIG_BLK_DEV_NVME_PLATFORM)
+static const struct nvme_ctrl_ops nvme_platform_ctrl_ops = {
+	.name			= "platform",
+	.module			= THIS_MODULE,
+	.flags			= NVME_F_METADATA_SUPPORTED,
+	.reg_read32		= nvme_reg_read32,
+	.reg_write32		= nvme_reg_write32,
+	.reg_read64		= nvme_reg_read64,
+	.free_ctrl		= nvme_free_ctrl,
+	.submit_async_event	= nvme_submit_async_event,
+	.get_address		= nvme_get_address,
+};
+
+static void nvme_platform_async_probe(void *data, async_cookie_t cookie)
+{
+	struct nvme_dev *dev = data;
+
+	flush_work(&dev->ctrl.reset_work);
+	flush_work(&dev->ctrl.scan_work);
+	nvme_put_ctrl(&dev->ctrl);
+}
+
+static int nvme_platform_probe(struct platform_device *pdev)
+{
+	int result;
+	struct nvme_dev *dev;
+	struct resource *res;
+
+	dev = nvme_dev_alloc(&pdev->dev);
+	if (!dev)
+		return -ENOMEM;
+
+	platform_set_drvdata(pdev, dev);
+	dev->bar = devm_platform_ioremap_resource(pdev, 0);
+	result = PTR_ERR_OR_ZERO(dev->bar);
+	if (result)
+		goto out;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res) {
+		result = ENXIO;
+		goto out_unmap;
+	}
+
+	dev->bar_mapped_size = resource_size(res);
+	dev->dbs = dev->bar + NVME_REG_DBS;
+
+	dev->platform_irq = platform_get_irq(pdev, 0);
+	if (dev->platform_irq < 0) {
+		result = dev->platform_irq;
+		goto out_unmap;
+	}
+
+	result = nvme_init_ctrl(&dev->ctrl, &pdev->dev, &nvme_platform_ctrl_ops,
+				NVME_QUIRK_SINGLE_VECTOR |
+				NVME_QUIRK_PLATFORM_DEVICE);
+	if (result)
+		goto out_unmap;
+
+	nvme_reset_ctrl(&dev->ctrl);
+	async_schedule(nvme_platform_async_probe, dev);
+
+	return 0;
+
+out_unmap:
+	devm_iounmap(&pdev->dev, dev->bar);
+out:
+	nvme_dev_free(dev);
+	return result;
+}
+
+static int nvme_platform_remove(struct platform_device *pdev)
+{
+	struct nvme_dev *dev = platform_get_drvdata(pdev);
+
+	nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DELETING);
+	platform_set_drvdata(pdev, NULL);
+
+	nvme_remove(dev);
+
+	nvme_uninit_ctrl(&dev->ctrl);
+
+	return 0;
+}
+
+struct of_device_id nvme_of_device_ids[] = {
+	{ .compatible = "generic-nvmexpress", },
+	{},
+};
+
+struct platform_driver nvme_platform_driver = {
+	.driver = {
+		.name = "nvme-platform",
+		.owner = THIS_MODULE,
+		.of_match_table = nvme_of_device_ids,
+	},
+	.probe = nvme_platform_probe,
+	.remove = nvme_platform_remove,
+};
+#endif
+
+#if IS_ENABLED(CONFIG_BLK_DEV_NVME)
 static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
 	.name			= "pcie",
 	.module			= THIS_MODULE,
@@ -3348,20 +3456,45 @@ static struct pci_driver nvme_driver = {
 	.sriov_configure = pci_sriov_configure_simple,
 	.err_handler	= &nvme_pci_err_handler,
 };
+#endif
 
 static int __init nvme_init(void)
 {
+	int ret;
+
 	BUILD_BUG_ON(sizeof(struct nvme_create_cq) != 64);
 	BUILD_BUG_ON(sizeof(struct nvme_create_sq) != 64);
 	BUILD_BUG_ON(sizeof(struct nvme_delete_queue) != 64);
 	BUILD_BUG_ON(IRQ_AFFINITY_MAX_SETS < 2);
 
-	return pci_register_driver(&nvme_driver);
+#if IS_ENABLED(CONFIG_BLK_DEV_NVME)
+	ret = pci_register_driver(&nvme_driver);
+	if (ret)
+		return ret;
+#endif
+
+#if IS_ENABLED(CONFIG_BLK_DEV_NVME_PLATFORM)
+	ret = platform_driver_register(&nvme_platform_driver);
+#endif
+
+#if IS_ENABLED(CONFIG_BLK_DEV_NVME)
+	if (ret)
+		pci_unregister_driver(&nvme_driver);
+#endif
+
+	return ret;
 }
 
 static void __exit nvme_exit(void)
 {
+#if IS_ENABLED(CONFIG_BLK_DEV_NVME)
 	pci_unregister_driver(&nvme_driver);
+#endif
+
+#if IS_ENABLED(CONFIG_BLK_DEV_NVME_PLATFORM)
+	platform_driver_unregister(&nvme_platform_driver);
+#endif
+
 	flush_workqueue(nvme_wq);
 }
 
