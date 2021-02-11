@@ -2772,6 +2772,89 @@ static int nvme_get_address(struct nvme_ctrl *ctrl, char *buf, int size)
 	return snprintf(buf, size, "%s\n", dev_name(dev));
 }
 
+static struct nvme_dev *nvme_dev_alloc(struct device *parent)
+{
+	struct nvme_dev *dev;
+	size_t alloc_size;
+	int node;
+
+	node = dev_to_node(parent);
+	if (node == NUMA_NO_NODE)
+		set_dev_node(parent, first_memory_node);
+
+	dev = kzalloc_node(sizeof(*dev), GFP_KERNEL, node);
+	if (!dev)
+		return NULL;
+
+	dev->dev = get_device(parent);
+	dev->nr_write_queues = write_queues;
+	dev->nr_poll_queues = poll_queues;
+	dev->nr_allocated_queues = nvme_max_io_queues(dev) + 1;
+	dev->queues = kcalloc_node(dev->nr_allocated_queues,
+			sizeof(struct nvme_queue), GFP_KERNEL, node);
+	if (!dev->queues)
+		goto free_dev;
+
+	INIT_WORK(&dev->ctrl.reset_work, nvme_reset_work);
+	INIT_WORK(&dev->remove_work, nvme_remove_dead_ctrl_work);
+	mutex_init(&dev->shutdown_lock);
+
+	if (nvme_setup_prp_pools(dev))
+		goto free_queue;
+
+	/*
+	 * Double check that our mempool alloc size will cover the biggest
+	 * command we support.
+	 */
+	alloc_size = nvme_iod_alloc_size();
+	WARN_ON_ONCE(alloc_size > PAGE_SIZE);
+
+	dev->iod_mempool = mempool_create_node(1, mempool_kmalloc,
+						mempool_kfree,
+						(void *) alloc_size,
+						GFP_KERNEL, node);
+	if (!dev->iod_mempool)
+		goto free_pools;
+
+	dev->dev = get_device(parent);
+	return dev;
+
+free_pools:
+	nvme_release_prp_pools(dev);
+free_queue:
+	kfree(dev->queues);
+free_dev:
+	kfree(dev);
+	return NULL;
+}
+
+static void nvme_dev_free(struct nvme_dev *dev)
+{
+	mempool_destroy(dev->iod_mempool);
+	nvme_release_prp_pools(dev);
+	put_device(dev->dev);
+	kfree(dev->queues);
+	kfree(dev);
+}
+
+/*
+ * The driver's remove may be called on a device in a partially initialized
+ * state. This function must not have any dependencies on the device state in
+ * order to proceed.
+ */
+static void nvme_remove(struct nvme_dev *dev)
+{
+	flush_work(&dev->ctrl.reset_work);
+	nvme_stop_ctrl(&dev->ctrl);
+	nvme_remove_namespaces(&dev->ctrl);
+	nvme_dev_disable(dev, true);
+	nvme_release_cmb(dev);
+	nvme_free_host_mem(dev);
+	nvme_dev_remove_admin(dev);
+	nvme_free_queues(dev, 0);
+	nvme_release_prp_pools(dev);
+}
+
 static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
 	.name			= "pcie",
 	.module			= THIS_MODULE,
@@ -2853,41 +2936,19 @@ static void nvme_async_probe(void *data, async_cookie_t cookie)
 
 static int nvme_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
-	int node, result = -ENOMEM;
+	int result;
 	struct nvme_dev *dev;
 	unsigned long quirks = id->driver_data;
-	size_t alloc_size;
 
-	node = dev_to_node(&pdev->dev);
-	if (node == NUMA_NO_NODE)
-		set_dev_node(&pdev->dev, first_memory_node);
-
-	dev = kzalloc_node(sizeof(*dev), GFP_KERNEL, node);
+	dev = nvme_dev_alloc(&pdev->dev);
 	if (!dev)
 		return -ENOMEM;
 
-	dev->nr_write_queues = write_queues;
-	dev->nr_poll_queues = poll_queues;
-	dev->nr_allocated_queues = nvme_max_io_queues(dev) + 1;
-	dev->queues = kcalloc_node(dev->nr_allocated_queues,
-			sizeof(struct nvme_queue), GFP_KERNEL, node);
-	if (!dev->queues)
-		goto free;
-
-	dev->dev = get_device(&pdev->dev);
 	pci_set_drvdata(pdev, dev);
 
 	result = nvme_pci_dev_map(pdev, dev);
 	if (result)
-		goto put_pci;
-
-	INIT_WORK(&dev->ctrl.reset_work, nvme_reset_work);
-	INIT_WORK(&dev->remove_work, nvme_remove_dead_ctrl_work);
-	mutex_init(&dev->shutdown_lock);
-
-	result = nvme_setup_prp_pools(dev);
-	if (result)
-		goto unmap;
+		goto out;
 
 	quirks |= nvme_pci_check_vendor_combination_bug(pdev);
 
@@ -2901,26 +2962,10 @@ static int nvme_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		quirks |= NVME_QUIRK_SIMPLE_SUSPEND;
 	}
 
-	/*
-	 * Double check that our mempool alloc size will cover the biggest
-	 * command we support.
-	 */
-	alloc_size = nvme_iod_alloc_size();
-	WARN_ON_ONCE(alloc_size > PAGE_SIZE);
-
-	dev->iod_mempool = mempool_create_node(1, mempool_kmalloc,
-						mempool_kfree,
-						(void *) alloc_size,
-						GFP_KERNEL, node);
-	if (!dev->iod_mempool) {
-		result = -ENOMEM;
-		goto release_pools;
-	}
-
 	result = nvme_init_ctrl(&dev->ctrl, &pdev->dev, &nvme_pci_ctrl_ops,
 			quirks);
 	if (result)
-		goto release_mempool;
+		goto out_unmap;
 
 	dev_info(dev->ctrl.device, "pci function %s\n", dev_name(&pdev->dev));
 
@@ -2929,17 +2974,10 @@ static int nvme_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	return 0;
 
- release_mempool:
-	mempool_destroy(dev->iod_mempool);
- release_pools:
-	nvme_release_prp_pools(dev);
- unmap:
+out_unmap:
 	nvme_pci_dev_unmap(pdev, dev);
- put_pci:
-	put_device(dev->dev);
- free:
-	kfree(dev->queues);
-	kfree(dev);
+out:
+	nvme_dev_free(dev);
 	return result;
 }
 
@@ -2971,11 +3009,6 @@ static void nvme_shutdown(struct pci_dev *pdev)
 	nvme_disable_prepare_reset(dev, true);
 }
 
-/*
- * The driver's remove may be called on a device in a partially initialized
- * state. This function must not have any dependencies on the device state in
- * order to proceed.
- */
 static void nvme_pci_remove(struct pci_dev *pdev)
 {
 	struct nvme_dev *dev = pci_get_drvdata(pdev);
@@ -2989,15 +3022,8 @@ static void nvme_pci_remove(struct pci_dev *pdev)
 		nvme_dev_remove_admin(dev);
 	}
 
-	flush_work(&dev->ctrl.reset_work);
-	nvme_stop_ctrl(&dev->ctrl);
-	nvme_remove_namespaces(&dev->ctrl);
-	nvme_dev_disable(dev, true);
-	nvme_release_cmb(dev);
-	nvme_free_host_mem(dev);
-	nvme_dev_remove_admin(dev);
-	nvme_free_queues(dev, 0);
-	nvme_release_prp_pools(dev);
+	nvme_remove(dev);
+
 	nvme_pci_dev_unmap(pdev, dev);
 	nvme_uninit_ctrl(&dev->ctrl);
 }
