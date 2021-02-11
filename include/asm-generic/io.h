@@ -942,7 +942,9 @@ static inline void *phys_to_virt(unsigned long address)
  *
  * ioremap_wc() and ioremap_wt() can provide more relaxed caching attributes
  * for specific drivers if the architecture choses to implement them.  If they
- * are not implemented we fall back to plain ioremap.
+ * are not implemented we fall back to plain ioremap. Conversely, ioremap_np()
+ * can provide stricter non-posted write semantics if the architecture
+ * implements them.
  */
 #ifndef CONFIG_MMU
 #ifndef ioremap
@@ -978,6 +980,10 @@ static inline void __iomem *ioremap(phys_addr_t addr, size_t size)
 
 #ifndef ioremap_wt
 #define ioremap_wt ioremap
+#endif
+
+#ifndef ioremap_np
+#define ioremap_np ioremap
 #endif
 
 /*
