@@ -1739,9 +1739,11 @@ static int nvme_configure_admin_queue(struct nvme_dev *dev)
 	struct nvme_queue *nvmeq;
 	struct pci_dev *pdev = nvme_pci_dev(dev);
 
-	result = nvme_pci_remap_bar(pdev, dev, db_bar_size(dev, 0));
-	if (result < 0)
-		return result;
+	if (pdev) {
+		result = nvme_pci_remap_bar(pdev, dev, db_bar_size(dev, 0));
+		if (result < 0)
+			return result;
+	}
 
 	dev->subsystem = readl(dev->bar + NVME_REG_VS) >= NVME_VS(1, 1, 0) ?
 				NVME_CAP_NSSRC(dev->ctrl.cap) : 0;
@@ -2237,14 +2239,14 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 			dev->cmb_use_sqes = false;
 	}
 
-	do {
+	while (pdev) {
 		size = db_bar_size(dev, nr_io_queues);
 		result = nvme_pci_remap_bar(pdev, dev, size);
 		if (!result)
 			break;
 		if (!--nr_io_queues)
 			return -ENOMEM;
-	} while (1);
+	};
 	adminq->q_db = dev->dbs;
 
  retry:
