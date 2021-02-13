@@ -1384,7 +1384,7 @@ static void nvme_free_queue(struct nvme_queue *nvmeq)
 	if (!nvmeq->sq_cmds)
 		return;
 
-	if (test_and_clear_bit(NVMEQ_SQ_CMB, &nvmeq->flags)) {
+	if (pdev && test_and_clear_bit(NVMEQ_SQ_CMB, &nvmeq->flags)) {
 		pci_free_p2pmem(pdev, nvmeq->sq_cmds, SQ_SIZE(nvmeq));
 	} else {
 		dma_free_coherent(nvmeq->dev->dev, SQ_SIZE(nvmeq),
@@ -1500,7 +1500,7 @@ static int nvme_pci_alloc_sq_cmds(struct nvme_dev *dev, struct nvme_queue *nvmeq
 {
 	struct pci_dev *pdev = nvme_pci_dev(dev);
 
-	if (qid && dev->cmb_use_sqes && (dev->cmbsz & NVME_CMBSZ_SQS)) {
+	if (pdev && qid && dev->cmb_use_sqes && (dev->cmbsz & NVME_CMBSZ_SQS)) {
 		nvmeq->sq_cmds = pci_alloc_p2pmem(pdev, SQ_SIZE(nvmeq));
 		if (nvmeq->sq_cmds) {
 			nvmeq->sq_dma_addr = pci_p2pmem_virt_to_bus(pdev,
