@@ -126,6 +126,7 @@ struct nvme_dev {
 	u32 db_stride;
 	void __iomem *bar;
 	unsigned long bar_mapped_size;
+	int platform_irq;
 	struct work_struct remove_work;
 	struct mutex shutdown_lock;
 	bool subsystem;
@@ -468,7 +469,7 @@ static int nvme_map_queues(struct blk_mq_tag_set *set)
 		 * affinity), so use the regular blk-mq cpu mapping
 		 */
 		map->queue_offset = qoff;
-		if (i != HCTX_TYPE_POLL && offset)
+		if (pdev && i != HCTX_TYPE_POLL && offset)
 			blk_mq_pci_map_queues(map, pdev, offset);
 		else
 			blk_mq_map_queues(map);
@@ -1087,7 +1088,10 @@ static int nvme_irq_vector(struct nvme_queue *nvmeq)
 {
 	struct pci_dev *pdev = nvme_pci_dev(nvmeq->dev);
 
-	return pci_irq_vector(pdev, nvmeq->cq_vector);
+	if (pdev)
+		return pci_irq_vector(pdev, nvmeq->cq_vector);
+
+	return nvmeq->dev->platform_irq;
 }
 
 /*
@@ -1402,7 +1406,10 @@ static void nvme_queue_free_irq(struct nvme_queue *nvmeq)
 {
 	struct pci_dev *pdev = nvme_pci_dev(nvmeq->dev);
 
-	pci_free_irq(pdev, nvmeq->cq_vector, nvmeq);
+	if (pdev)
+		pci_free_irq(pdev, nvmeq->cq_vector, nvmeq);
+	else
+		free_irq(nvmeq->dev->platform_irq, nvmeq);
 }
 
 
@@ -1552,15 +1559,24 @@ static int nvme_alloc_queue(struct nvme_dev *dev, int qid, int depth)
 static int nvme_queue_request_irq(struct nvme_queue *nvmeq)
 {
 	struct pci_dev *pdev = nvme_pci_dev(nvmeq->dev);
+	irq_handler_t handler, thread_fn;
 	int nr = nvmeq->dev->ctrl.instance;
 
 	if (use_threaded_interrupts) {
-		return pci_request_irq(pdev, nvmeq->cq_vector, nvme_irq_check,
-				nvme_irq, nvmeq, "nvme%dq%d", nr, nvmeq->qid);
+		handler = nvme_irq_check;
+		thread_fn = nvme_irq;
 	} else {
-		return pci_request_irq(pdev, nvmeq->cq_vector, nvme_irq,
-				NULL, nvmeq, "nvme%dq%d", nr, nvmeq->qid);
+		handler = nvme_irq;
+		thread_fn = NULL;
 	}
+
+	if (pdev)
+		return pci_request_irq(pdev, nvmeq->cq_vector, handler,
+				       thread_fn, nvmeq, "nvme%dq%d", nr,
+				       nvmeq->qid);
+
+	return request_threaded_irq(nvmeq->dev->platform_irq, handler,
+				    thread_fn, IRQF_SHARED, "nvme", nvmeq);
 }
 
 static void nvme_init_queue(struct nvme_queue *nvmeq, u16 qid)
@@ -2146,6 +2162,13 @@ static int nvme_setup_irqs(struct nvme_dev *dev, unsigned int nr_io_queues)
 	irq_queues = 1;
 	if (!(dev->ctrl.quirks & NVME_QUIRK_SINGLE_VECTOR))
 		irq_queues += (nr_io_queues - poll_queues);
+
+	/*
+	 * platform devices only support a single queue and no affinity for now
+	 */
+	if (!pdev)
+		return 1;
+
 	return pci_alloc_irq_vectors_affinity(pdev, 1, irq_queues,
 			      PCI_IRQ_ALL_TYPES | PCI_IRQ_AFFINITY, &affd);
 }
@@ -2225,7 +2248,10 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	adminq->q_db = dev->dbs;
 
  retry:
-	nvme_pci_free_irqs(pdev, dev);
+	if (pdev)
+		nvme_pci_free_irqs(pdev, dev);
+	else
+		free_irq(dev->platform_irq, adminq);
 
 	result = nvme_setup_irqs(dev, nr_io_queues);
 	if (result <= 0)
