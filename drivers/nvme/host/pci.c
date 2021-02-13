@@ -2374,34 +2374,17 @@ static void nvme_dev_add(struct nvme_dev *dev)
 	nvme_dbbuf_set(dev);
 }
 
-static int nvme_pci_enable(struct pci_dev *pdev, struct nvme_dev *dev)
+static int nvme_enable(struct nvme_dev *dev)
 {
-	int result = -ENOMEM;
 	int dma_address_bits = 64;
-
-	if (pci_enable_device_mem(pdev))
-		return result;
-
-	pci_set_master(pdev);
 
 	if (dev->ctrl.quirks & NVME_QUIRK_DMA_ADDRESS_BITS_48)
 		dma_address_bits = 48;
 	if (dma_set_mask_and_coherent(dev->dev, DMA_BIT_MASK(dma_address_bits)))
-		goto disable;
+		return -ENXIO;
 
-	if (readl(dev->bar + NVME_REG_CSTS) == -1) {
-		result = -ENODEV;
-		goto disable;
-	}
-
-	/*
-	 * Some devices and/or platforms don't advertise or work with INTx
-	 * interrupts. Pre-enable a single MSIX or MSI vec for setup. We'll
-	 * adjust this later.
-	 */
-	result = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
-	if (result < 0)
-		return result;
+	if (readl(dev->bar + NVME_REG_CSTS) == -1)
+		return -ENODEV;
 
 	dev->ctrl.cap = lo_hi_readq(dev->bar + NVME_REG_CAP);
 
@@ -2422,6 +2405,42 @@ static int nvme_pci_enable(struct pci_dev *pdev, struct nvme_dev *dev)
 		dev->io_sqes = NVME_NVM_IOSQES;
 
 	/*
+	 * Controllers with the shared tags quirk need the IO queue to be
+	 * big enough so that we get 32 tags for the admin queue
+	 */
+	if ((dev->ctrl.quirks & NVME_QUIRK_SHARED_TAGS) &&
+	    (dev->q_depth < (NVME_AQ_DEPTH + 2))) {
+		dev->q_depth = NVME_AQ_DEPTH + 2;
+		dev_warn(dev->ctrl.device, "IO queue depth clamped to %d\n",
+			 dev->q_depth);
+	}
+
+	return 0;
+}
+
+static int nvme_pci_enable(struct pci_dev *pdev, struct nvme_dev *dev)
+{
+	int result = -ENOMEM;
+
+	if (pci_enable_device_mem(pdev))
+		return result;
+
+	pci_set_master(pdev);
+
+	result = nvme_enable(dev);
+	if (result)
+		goto disable;
+
+	/*
+	 * Some devices and/or platforms don't advertise or work with INTx
+	 * interrupts. Pre-enable a single MSIX or MSI vec for setup. We'll
+	 * adjust this later.
+	 */
+	result = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
+	if (result < 0)
+		return result;
+
+	/*
 	 * Temporary fix for the Apple controller found in the MacBook8,1 and
 	 * some MacBook7,1 to avoid controller resets and data loss.
 	 */
@@ -2437,18 +2456,6 @@ static int nvme_pci_enable(struct pci_dev *pdev, struct nvme_dev *dev)
 		dev_err(dev->ctrl.device, "detected PM1725 NVMe controller, "
                         "set queue depth=%u\n", dev->q_depth);
 	}
-
-	/*
-	 * Controllers with the shared tags quirk need the IO queue to be
-	 * big enough so that we get 32 tags for the admin queue
-	 */
-	if ((dev->ctrl.quirks & NVME_QUIRK_SHARED_TAGS) &&
-	    (dev->q_depth < (NVME_AQ_DEPTH + 2))) {
-		dev->q_depth = NVME_AQ_DEPTH + 2;
-		dev_warn(dev->ctrl.device, "IO queue depth clamped to %d\n",
-			 dev->q_depth);
-	}
-
 
 	nvme_pci_map_cmb(pdev, dev);
 
@@ -2484,7 +2491,7 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 	struct pci_dev *pdev = nvme_pci_dev(dev);
 
 	mutex_lock(&dev->shutdown_lock);
-	if (pci_is_enabled(pdev)) {
+	if (!pdev || pci_is_enabled(pdev)) {
 		u32 csts = readl(dev->bar + NVME_REG_CSTS);
 
 		if (dev->ctrl.state == NVME_CTRL_LIVE ||
@@ -2511,7 +2518,8 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 	}
 	nvme_suspend_io_queues(dev);
 	nvme_suspend_queue(&dev->queues[0]);
-	nvme_pci_disable(pdev, dev);
+	if (pdev)
+		nvme_pci_disable(pdev, dev);
 	nvme_reap_pending_cqes(dev);
 
 	blk_mq_tagset_busy_iter(&dev->tagset, nvme_cancel_request, &dev->ctrl);
@@ -2622,7 +2630,10 @@ static void nvme_reset_work(struct work_struct *work)
 	nvme_sync_queues(&dev->ctrl);
 
 	mutex_lock(&dev->shutdown_lock);
-	result = nvme_pci_enable(pdev, dev);
+	if (pdev)
+		result = nvme_pci_enable(pdev, dev);
+	else
+		result = nvme_enable(dev);
 	if (result)
 		goto out_unlock;
 
