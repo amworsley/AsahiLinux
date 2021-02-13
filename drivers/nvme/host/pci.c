@@ -1251,7 +1251,11 @@ static void nvme_warn_reset(struct nvme_dev *dev, u32 csts)
 	u16 pci_status;
 	int result;
 
-	result = pci_read_config_word(pdev, PCI_STATUS, &pci_status);
+	if (pdev)
+		result = pci_read_config_word(pdev, PCI_STATUS, &pci_status);
+	else
+		result = PCIBIOS_DEVICE_NOT_FOUND;
+
 	if (result == PCIBIOS_SUCCESSFUL)
 		dev_warn(dev->ctrl.device,
 			 "controller is down; will reset: CSTS=0x%x, PCI_STATUS=0x%hx\n",
@@ -1275,9 +1279,11 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
 	/* If PCI error recovery process is happening, we cannot reset or
 	 * the recovery mechanism will surely fail.
 	 */
-	mb();
-	if (pci_channel_offline(pdev))
-		return BLK_EH_RESET_TIMER;
+	if (pdev) {
+		mb();
+		if (pci_channel_offline(pdev))
+			return BLK_EH_RESET_TIMER;
+	}
 
 	/*
 	 * Reset immediately if the controller is failed
@@ -2527,8 +2533,10 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 			freeze = true;
 			nvme_start_freeze(&dev->ctrl);
 		}
-		dead = !!((csts & NVME_CSTS_CFS) || !(csts & NVME_CSTS_RDY) ||
-			pdev->error_state  != pci_channel_io_normal);
+		dead = !!((csts & NVME_CSTS_CFS) || !(csts & NVME_CSTS_RDY));
+
+		if (pdev && pdev->error_state != pci_channel_io_normal)
+			dead = true;
 	}
 
 	/*
