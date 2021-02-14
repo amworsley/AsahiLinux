@@ -34,11 +34,25 @@ properties:
               - arm,armv8-timer
 
   interrupts:
+    minItems: 1
+    maxItems: 5
     items:
       - description: secure timer irq
       - description: non-secure timer irq
       - description: virtual timer irq
       - description: hypervisor timer irq
+      - description: hypervisor virtual timer irq
+
+  interrupt-names:
+    minItems: 1
+    maxItems: 5
+    items:
+      enum:
+        - phys-secure
+        - phys
+        - virt
+        - hyp-phys
+        - hyp-virt
 
   clock-frequency:
     description: The frequency of the main counter, in Hz. Should be present
