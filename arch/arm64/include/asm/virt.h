@@ -72,6 +72,11 @@ void __hyp_reset_vectors(void);
 
 DECLARE_STATIC_KEY_FALSE(kvm_protected_mode_initialized);
 
+static inline bool is_kernel_in_hyp_mode(void)
+{
+	return read_sysreg(CurrentEL) == CurrentEL_EL2;
+}
+
 /* Reports the availability of HYP mode */
 static inline bool is_hyp_mode_available(void)
 {
@@ -82,6 +87,10 @@ static inline bool is_hyp_mode_available(void)
 	if (IS_ENABLED(CONFIG_KVM) &&
 	    static_branch_likely(&kvm_protected_mode_initialized))
 		return true;
+
+	/* Catch braindead CPUs */
+	if (!IS_ENABLED(CONFIG_ARM64_VHE) && is_kernel_in_hyp_mode())
+		return false;
 
 	return (__boot_cpu_mode[0] == BOOT_CPU_MODE_EL2 &&
 		__boot_cpu_mode[1] == BOOT_CPU_MODE_EL2);
@@ -98,12 +107,11 @@ static inline bool is_hyp_mode_mismatched(void)
 	    static_branch_likely(&kvm_protected_mode_initialized))
 		return false;
 
-	return __boot_cpu_mode[0] != __boot_cpu_mode[1];
-}
+	/* Catch braindead CPUs */
+	if (!IS_ENABLED(CONFIG_ARM64_VHE) && is_kernel_in_hyp_mode())
+		return true;
 
-static inline bool is_kernel_in_hyp_mode(void)
-{
-	return read_sysreg(CurrentEL) == CurrentEL_EL2;
+	return __boot_cpu_mode[0] != __boot_cpu_mode[1];
 }
 
 static __always_inline bool has_vhe(void)

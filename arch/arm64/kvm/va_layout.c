@@ -156,6 +156,9 @@ void __init kvm_update_va_mask(struct alt_instr *alt,
 {
 	int i;
 
+	if (!is_hyp_mode_available())
+		return;
+
 	BUG_ON(nr_inst != 5);
 
 	for (i = 0; i < nr_inst; i++) {
@@ -190,6 +193,9 @@ void kvm_patch_vector_branch(struct alt_instr *alt,
 {
 	u64 addr;
 	u32 insn;
+
+	if (!is_hyp_mode_available())
+		return;
 
 	BUG_ON(nr_inst != 4);
 
@@ -243,6 +249,9 @@ void kvm_patch_vector_branch(struct alt_instr *alt,
 static void generate_mov_q(u64 val, __le32 *origptr, __le32 *updptr, int nr_inst)
 {
 	u32 insn, oinsn, rd;
+
+	if (!is_hyp_mode_available())
+		return;
 
 	BUG_ON(nr_inst != 4);
 
