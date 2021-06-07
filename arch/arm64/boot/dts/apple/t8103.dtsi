@@ -108,6 +108,7 @@
 		#size-cells = <2>;
 
 		ranges;
+		dma-ranges;
 		nonposted-mmio;
 
 		serial0: serial@235200000 {
