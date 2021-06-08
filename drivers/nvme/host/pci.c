@@ -18,6 +18,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of_device.h>
 #include <linux/once.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
@@ -28,6 +29,8 @@
 #include <linux/io-64-nonatomic-hi-lo.h>
 #include <linux/sed-opal.h>
 #include <linux/pci-p2pdma.h>
+#include <linux/iopoll.h>
+#include <linux/mailbox_client.h>
 
 #include "trace.h"
 #include "nvme.h"
@@ -43,6 +46,35 @@
  */
 #define NVME_MAX_KB_SZ	4096
 #define NVME_MAX_SEGS	127
+
+/* Apple ANS2 registers */
+#define APPLE_ANS2_QUEUE_DEPTH 64
+#define APPLE_ANS2_MAX_PEND_CMDS 64
+#define APPLE_NVMMU_NUM_TCBS 64
+
+#define APPLE_ANS2_LINEAR_ASQ_DB 0x2490c
+#define APPLE_ANS2_LINEAR_IOSQ_DB 0x24910
+
+#define APPLE_NVMMU_NUM 0x28100
+#define APPLE_NVMMU_BASE_ASQ 0x28108
+#define APPLE_NVMMU_BASE_IOSQ 0x28110
+#define APPLE_NVMMU_TCB_INVAL 0x28118
+#define APPLE_NVMMU_TCB_STAT 0x28120
+#define APPLE_NVMMU_TCB_SIZE (sizeof(struct apple_nvmmu_tcb) * APPLE_NVMMU_NUM_TCBS)
+
+#define APPLE_ANS2_MAX_PEND_CMDS_CTRL 0x1210
+
+#define APPLE_ANS2_BOOT_STATUS 0x1300
+#define APPLE_ANS2_BOOT_STATUS_OK 0xde71ce55
+
+#define APPLE_ANS2_UNKNOWN_CTRL 0x24008
+#define APPLE_ANS2_PRP_NULL_CHECK BIT(11)
+
+#define APPLE_ANS2_LINEAR_SQ_CTRL 0x24908
+#define APPLE_ANS2_LINEAR_SQ_EN BIT(0)
+
+#define APPLE_ANS2_TCB_DMA_FROM_DEVICE BIT(0)
+#define APPLE_ANS2_TCB_DMA_TO_DEVICE BIT(1)
 
 static int use_threaded_interrupts;
 module_param(use_threaded_interrupts, int, 0);
@@ -156,6 +188,10 @@ struct nvme_dev {
 	unsigned int nr_allocated_queues;
 	unsigned int nr_write_queues;
 	unsigned int nr_poll_queues;
+
+	/* Apple ANS2 support */
+	struct mbox_client ans2_mbox;
+	struct mbox_chan *ans2_chan;
 };
 
 static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
@@ -226,6 +262,10 @@ struct nvme_queue {
 	u32 *dbbuf_sq_ei;
 	u32 *dbbuf_cq_ei;
 	struct completion delete_done;
+
+	u32 __iomem *ans2_q_db;
+	void *ans2_tcb_ptr;
+	dma_addr_t ans2_tcb_dma_addr;
 };
 
 /*
@@ -247,6 +287,58 @@ struct nvme_iod {
 	dma_addr_t meta_dma;
 	struct scatterlist *sg;
 };
+
+/* Apple ANS2 support */
+struct apple_nvmmu_tcb {
+	u8 opcode;
+	u8 dma_flags;
+	u8 command_id;
+	u8 _unk0;
+	u32 length;
+	u64 _unk1[2];
+	u64 prp1;
+	u64 prp2;
+	u64 _unk2[2];
+	u8 aes_iv[8];
+	u8 _aes_unk[64];
+};
+
+static void nvme_apple_nvmmu_inval(struct nvme_queue *nvmeq, unsigned tag)
+{
+	struct nvme_dev *dev = nvmeq->dev;
+	struct apple_nvmmu_tcb *tcb;
+
+	tcb = nvmeq->ans2_tcb_ptr + tag * sizeof(struct apple_nvmmu_tcb);
+	memset(tcb, 0, sizeof(*tcb));
+
+	writel(tag, dev->bar + APPLE_NVMMU_TCB_INVAL);
+	if (readl(dev->bar + APPLE_NVMMU_TCB_STAT))
+		dev_warn(dev->dev, "NVMMU TCB invalidation failed\n");
+}
+
+static void nvme_apple_submit_cmd(struct nvme_queue *nvmeq,
+				  struct nvme_command *cmd)
+{
+	u32 tag = cmd->common.command_id;
+	struct apple_nvmmu_tcb *tcb;
+
+	tcb = nvmeq->ans2_tcb_ptr + tag * sizeof(struct apple_nvmmu_tcb);
+	memset(tcb, 0, sizeof(*tcb));
+
+	tcb->opcode = cmd->common.opcode;
+	tcb->prp1 = cmd->common.dptr.prp1;
+	tcb->prp2 = cmd->common.dptr.prp2;
+	tcb->length = cmd->rw.length;
+	tcb->command_id = tag;
+
+	if (nvme_is_write(cmd))
+		tcb->dma_flags = APPLE_ANS2_TCB_DMA_TO_DEVICE;
+	else
+		tcb->dma_flags = APPLE_ANS2_TCB_DMA_FROM_DEVICE;
+
+	memcpy(nvmeq->sq_cmds + (tag << nvmeq->sqes), cmd, sizeof(*cmd));
+	writel(tag, nvmeq->ans2_q_db);
+}
 
 static inline unsigned int nvme_dbbuf_size(struct nvme_dev *dev)
 {
@@ -506,6 +598,18 @@ static inline void nvme_write_sq_db(struct nvme_queue *nvmeq, bool write_sq)
 	nvmeq->last_sq_tail = nvmeq->sq_tail;
 }
 
+static void nvme_common_submit_cmd(struct nvme_queue *nvmeq,
+				   struct nvme_command *cmd, bool write_sq)
+{
+	spin_lock(&nvmeq->sq_lock);
+	memcpy(nvmeq->sq_cmds + (nvmeq->sq_tail << nvmeq->sqes), cmd,
+	       sizeof(*cmd));
+	if (++nvmeq->sq_tail == nvmeq->q_depth)
+		nvmeq->sq_tail = 0;
+	nvme_write_sq_db(nvmeq, write_sq);
+	spin_unlock(&nvmeq->sq_lock);
+}
+
 /**
  * nvme_submit_cmd() - Copy a command into a queue and ring the doorbell
  * @nvmeq: The queue to use
@@ -515,18 +619,18 @@ static inline void nvme_write_sq_db(struct nvme_queue *nvmeq, bool write_sq)
 static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
 			    bool write_sq)
 {
-	spin_lock(&nvmeq->sq_lock);
-	memcpy(nvmeq->sq_cmds + (nvmeq->sq_tail << nvmeq->sqes),
-	       cmd, sizeof(*cmd));
-	if (++nvmeq->sq_tail == nvmeq->q_depth)
-		nvmeq->sq_tail = 0;
-	nvme_write_sq_db(nvmeq, write_sq);
-	spin_unlock(&nvmeq->sq_lock);
+	if (nvmeq->dev->ctrl.quirks & NVME_QUIRK_APPLE_ANS2)
+		nvme_apple_submit_cmd(nvmeq, cmd);
+	else
+		nvme_common_submit_cmd(nvmeq, cmd, write_sq);
 }
 
 static void nvme_commit_rqs(struct blk_mq_hw_ctx *hctx)
 {
 	struct nvme_queue *nvmeq = hctx->driver_data;
+
+	if (nvmeq->dev->ctrl.quirks & NVME_QUIRK_APPLE_ANS2)
+		return;
 
 	spin_lock(&nvmeq->sq_lock);
 	if (nvmeq->sq_tail != nvmeq->last_sq_tail)
@@ -1015,6 +1119,9 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
 	__u16 command_id = READ_ONCE(cqe->command_id);
 	struct request *req;
 
+	if (nvmeq->dev->ctrl.quirks & NVME_QUIRK_APPLE_ANS2)
+		nvme_apple_nvmmu_inval(nvmeq, command_id);
+
 	/*
 	 * AEN requests are special as they don't time out and can
 	 * survive any kind of queue freeze and often don't respond to
@@ -1396,6 +1503,10 @@ static void nvme_free_queue(struct nvme_queue *nvmeq)
 	if (!nvmeq->sq_cmds)
 		return;
 
+	if (nvmeq->ans2_tcb_ptr)
+		dma_free_coherent(nvmeq->dev->dev, APPLE_NVMMU_TCB_SIZE,
+				nvmeq->ans2_tcb_ptr, nvmeq->ans2_tcb_dma_addr);
+
 	if (pdev && test_and_clear_bit(NVMEQ_SQ_CMB, &nvmeq->flags)) {
 		pci_free_p2pmem(pdev, nvmeq->sq_cmds, SQ_SIZE(nvmeq));
 	} else {
@@ -1539,6 +1650,8 @@ static int nvme_alloc_queue(struct nvme_dev *dev, int qid, int depth)
 
 	if (dev->ctrl.queue_count > qid)
 		return 0;
+	if (dev->ctrl.quirks & NVME_QUIRK_APPLE_ANS2 && qid > 1)
+		return -ENODEV;
 
 	nvmeq->sqes = qid ? dev->io_sqes : NVME_ADM_SQES;
 	nvmeq->q_depth = depth;
@@ -1547,8 +1660,27 @@ static int nvme_alloc_queue(struct nvme_dev *dev, int qid, int depth)
 	if (!nvmeq->cqes)
 		goto free_nvmeq;
 
+	if (dev->ctrl.quirks & NVME_QUIRK_APPLE_ANS2) {
+		nvmeq->ans2_tcb_ptr =
+			dma_alloc_coherent(dev->dev, APPLE_NVMMU_TCB_SIZE,
+					   &nvmeq->ans2_tcb_dma_addr,
+					   GFP_KERNEL);
+		if (!nvmeq->ans2_tcb_ptr)
+			goto free_cqdma;
+
+		if (qid == 0) {
+			lo_hi_writeq(nvmeq->ans2_tcb_dma_addr,
+				     dev->bar + APPLE_NVMMU_BASE_ASQ);
+			nvmeq->ans2_q_db = dev->bar + APPLE_ANS2_LINEAR_ASQ_DB;
+		} else {
+			lo_hi_writeq(nvmeq->ans2_tcb_dma_addr,
+				     dev->bar + APPLE_NVMMU_BASE_IOSQ);
+			nvmeq->ans2_q_db = dev->bar + APPLE_ANS2_LINEAR_IOSQ_DB;
+		}
+	}
+
 	if (nvme_pci_alloc_sq_cmds(dev, nvmeq, qid))
-		goto free_cqdma;
+		goto free_ans2;
 
 	nvmeq->dev = dev;
 	spin_lock_init(&nvmeq->sq_lock);
@@ -1561,6 +1693,16 @@ static int nvme_alloc_queue(struct nvme_dev *dev, int qid, int depth)
 
 	return 0;
 
+ free_ans2:
+	if (nvmeq->ans2_tcb_ptr) {
+		dma_free_coherent(dev->dev, APPLE_NVMMU_TCB_SIZE,
+				  nvmeq->ans2_tcb_ptr,
+				  nvmeq->ans2_tcb_dma_addr);
+		if (qid == 0)
+			lo_hi_writeq(0, dev->bar + APPLE_NVMMU_BASE_ASQ);
+		else
+			lo_hi_writeq(0, dev->bar + APPLE_NVMMU_BASE_IOSQ);
+	}
  free_cqdma:
 	dma_free_coherent(dev->dev, CQ_SIZE(nvmeq), (void *)nvmeq->cqes,
 			  nvmeq->cq_dma_addr);
@@ -2455,6 +2597,9 @@ static int nvme_enable(struct nvme_dev *dev)
 			 dev->q_depth);
 	}
 
+	if (dev->ctrl.quirks & NVME_QUIRK_APPLE_ANS2)
+		dev->q_depth = APPLE_ANS2_QUEUE_DEPTH;
+
 	return 0;
 }
 
@@ -2921,6 +3066,10 @@ static const struct nvme_ctrl_ops nvme_platform_ctrl_ops = {
 	.get_address		= nvme_get_address,
 };
 
+struct nvme_plat_priv {
+	u32 quirks;
+};
+
 static void nvme_platform_async_probe(void *data, async_cookie_t cookie)
 {
 	struct nvme_dev *dev = data;
@@ -2930,15 +3079,28 @@ static void nvme_platform_async_probe(void *data, async_cookie_t cookie)
 	nvme_put_ctrl(&dev->ctrl);
 }
 
+static void nvme_apple_rx_callback(struct mbox_client *cl, void *msg)
+{
+	struct device *dev = cl->dev;
+	dev_warn(dev, "Unexpected message from ANS2: %016llx\n", (u64)msg);
+}
+
 static int nvme_platform_probe(struct platform_device *pdev)
 {
 	int result;
 	struct nvme_dev *dev;
 	struct resource *res;
+	const struct nvme_plat_priv *priv_match;
+	u32 ans2_boot_status;
+	u32 quirks = NVME_QUIRK_SINGLE_VECTOR | NVME_QUIRK_PLATFORM_DEVICE;
 
 	dev = nvme_dev_alloc(&pdev->dev);
 	if (!dev)
 		return -ENOMEM;
+
+	priv_match = of_device_get_match_data(&pdev->dev);
+	if (priv_match)
+		quirks |= priv_match->quirks;
 
 	platform_set_drvdata(pdev, dev);
 	dev->bar = devm_platform_ioremap_resource(pdev, 0);
@@ -2961,9 +3123,34 @@ static int nvme_platform_probe(struct platform_device *pdev)
 		goto out_unmap;
 	}
 
+	if (quirks & NVME_QUIRK_APPLE_ANS2) {
+		dev->ans2_mbox.dev = dev->dev;
+		dev->ans2_mbox.rx_callback = &nvme_apple_rx_callback;
+		dev->ans2_chan = mbox_request_channel(&dev->ans2_mbox, 0);
+		if (!dev->ans2_chan)
+			goto out_unmap;
+
+		result = readl_poll_timeout(
+			dev->bar + APPLE_ANS2_BOOT_STATUS, ans2_boot_status,
+			ans2_boot_status == APPLE_ANS2_BOOT_STATUS_OK, 100,
+			10000000);
+		if (result) {
+			dev_err(dev->dev, "ANS did not boot");
+			goto out_unmap;
+		}
+
+		writel(APPLE_ANS2_MAX_PEND_CMDS | (APPLE_ANS2_MAX_PEND_CMDS << 16),
+		       dev->bar + APPLE_ANS2_MAX_PEND_CMDS_CTRL);
+		writel(APPLE_ANS2_LINEAR_SQ_EN,
+		       dev->bar + APPLE_ANS2_LINEAR_SQ_CTRL);
+		writel(readl(dev->bar + APPLE_ANS2_UNKNOWN_CTRL) &
+			       ~APPLE_ANS2_PRP_NULL_CHECK,
+		       dev->bar + APPLE_ANS2_UNKNOWN_CTRL);
+		writel(APPLE_NVMMU_NUM_TCBS - 1, dev->bar + APPLE_NVMMU_NUM);
+	}
+
 	result = nvme_init_ctrl(&dev->ctrl, &pdev->dev, &nvme_platform_ctrl_ops,
-				NVME_QUIRK_SINGLE_VECTOR |
-				NVME_QUIRK_PLATFORM_DEVICE);
+				quirks);
 	if (result)
 		goto out_unmap;
 
@@ -2993,8 +3180,13 @@ static int nvme_platform_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct nvme_plat_priv nvme_plat_apple = {
+	.quirks = NVME_QUIRK_APPLE_ANS2 | NVME_QUIRK_SHARED_TAGS,
+};
+
 struct of_device_id nvme_of_device_ids[] = {
 	{ .compatible = "generic-nvmexpress", },
+	{ .compatible = "apple,t8103-nvmexpress", .data = &nvme_plat_apple, },
 	{},
 };
 
@@ -3465,6 +3657,7 @@ static int __init nvme_init(void)
 	BUILD_BUG_ON(sizeof(struct nvme_create_cq) != 64);
 	BUILD_BUG_ON(sizeof(struct nvme_create_sq) != 64);
 	BUILD_BUG_ON(sizeof(struct nvme_delete_queue) != 64);
+	BUILD_BUG_ON(sizeof(struct apple_nvmmu_tcb) != 128);
 	BUILD_BUG_ON(IRQ_AFFINITY_MAX_SETS < 2);
 
 #if IS_ENABLED(CONFIG_BLK_DEV_NVME)
