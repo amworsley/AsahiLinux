@@ -15,6 +15,8 @@
 #include <linux/usb/typec.h>
 #include <linux/usb/role.h>
 
+#include <linux/kthread.h>
+
 #include "tps6598x.h"
 #include "trace.h"
 
@@ -467,6 +469,17 @@ err_unlock:
 	return IRQ_HANDLED;
 }
 
+static int tps6598x_HACK(void *data)
+{
+	while (1) {
+		tps6598x_interrupt(0, data);
+		msleep(1000);
+		printk("hi!\n");
+	}
+
+	return 0;
+}
+
 static int tps6598x_check_mode(struct tps6598x *tps)
 {
 	char mode[5] = { };
@@ -687,7 +700,7 @@ static int tps6598x_probe(struct i2c_client *client)
 			dev_err(&client->dev, "failed to register partner\n");
 	}
 
-	ret = devm_request_threaded_irq(&client->dev, client->irq, NULL,
+	/*ret = devm_request_threaded_irq(&client->dev, client->irq, NULL,
 					tps6598x_interrupt,
 					IRQF_SHARED | IRQF_ONESHOT,
 					dev_name(&client->dev), tps);
@@ -695,7 +708,9 @@ static int tps6598x_probe(struct i2c_client *client)
 		tps6598x_disconnect(tps, 0);
 		typec_unregister_port(tps->port);
 		goto err_role_put;
-	}
+	}*/
+
+	kthread_run(tps6598x_HACK, tps, dev_name(&client->dev));
 
 	i2c_set_clientdata(client, tps);
 
