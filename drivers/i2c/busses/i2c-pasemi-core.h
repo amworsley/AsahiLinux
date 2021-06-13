@@ -14,6 +14,7 @@ struct pasemi_smbus {
 	void __iomem		*ioaddr;
 	unsigned long		 base;
 	int			 size;
+	int			 need_ctl_unk800;
 };
 
 extern const struct i2c_algorithm smbus_algorithm;

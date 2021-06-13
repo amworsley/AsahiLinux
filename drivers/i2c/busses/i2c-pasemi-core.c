@@ -63,8 +63,12 @@ static inline int reg_read(struct pasemi_smbus *smbus, int reg)
 
 static void pasemi_reset(struct pasemi_smbus *smbus)
 {
-	reg_write(smbus, REG_CTL, (CTL_MTR | CTL_MRR |
-		  (CLK_100K_DIV & CTL_CLK_M)));
+	u32 val = (CTL_MTR | CTL_MRR | (CLK_400K_DIV & CTL_CLK_M));
+
+	if (smbus->need_ctl_unk800)
+		val |= 0x800;
+
+	reg_write(smbus, REG_CTL, val);
 }
 
 static void pasemi_smb_clear(struct pasemi_smbus *smbus)

@@ -33,6 +33,7 @@ static int pasemi_i2c_platform_probe(struct platform_device *pdev)
 	smbus->ioaddr = devm_ioremap_resource(smbus->dev, res);
 	smbus->base = res->start;
 	smbus->size = resource_size(res);
+	smbus->need_ctl_unk800 = 1;
 
 	if (IS_ERR(smbus->ioaddr))
 		return PTR_ERR(smbus->ioaddr);

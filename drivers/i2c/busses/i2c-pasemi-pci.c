@@ -35,6 +35,7 @@ static int pasemi_smb_pci_probe(struct pci_dev *dev,
 	smbus->dev = &dev->dev;
 	smbus->base = pci_resource_start(dev, 0);
 	smbus->size = pci_resource_len(dev, 0);
+	smbus->need_ctl_unk800 = 0;
 
 	if (!request_region(smbus->base, smbus->size,
 			    pasemi_smb_pci_driver.name)) {
