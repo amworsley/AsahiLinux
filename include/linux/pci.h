@@ -973,6 +973,17 @@ enum {
 #define PCI_IRQ_MSIX		(1 << 2) /* Allow MSI-X interrupts */
 #define PCI_IRQ_AFFINITY	(1 << 3) /* Auto-assign affinity */
 
+/*
+ * Virtual interrupts allow for more interrupts to be allocated
+ * than the device has interrupts for. These are not programmed
+ * into the device's MSI-X table and must be handled by some
+ * other driver means.
+ */
+#define PCI_IRQ_VIRTUAL		(1 << 4)
+
+#define PCI_IRQ_ALL_TYPES \
+	(PCI_IRQ_LEGACY | PCI_IRQ_MSI | PCI_IRQ_MSIX)
+
 /* These external functions are only available when PCI support is enabled */
 #ifdef CONFIG_PCI
 
@@ -1449,17 +1460,6 @@ resource_size_t pcibios_window_alignment(struct pci_bus *bus,
 
 int pci_set_vga_state(struct pci_dev *pdev, bool decode,
 		      unsigned int command_bits, u32 flags);
-
-/*
- * Virtual interrupts allow for more interrupts to be allocated
- * than the device has interrupts for. These are not programmed
- * into the device's MSI-X table and must be handled by some
- * other driver means.
- */
-#define PCI_IRQ_VIRTUAL		(1 << 4)
-
-#define PCI_IRQ_ALL_TYPES \
-	(PCI_IRQ_LEGACY | PCI_IRQ_MSI | PCI_IRQ_MSIX)
 
 /* kmem_cache style wrapper around pci_alloc_consistent() */
 
