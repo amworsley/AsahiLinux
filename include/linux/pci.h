@@ -1736,10 +1736,14 @@ static inline struct pci_dev *pci_get_class(unsigned int class,
 
 static inline void pci_set_master(struct pci_dev *dev) { }
 static inline int pci_enable_device(struct pci_dev *dev) { return -EIO; }
+static inline int pci_enable_device_mem(struct pci_dev *dev) { return -EIO; }
+static inline int pci_is_enabled(struct pci_dev *pdev) { return 0; }
 static inline void pci_disable_device(struct pci_dev *dev) { }
 static inline int pcim_enable_device(struct pci_dev *pdev) { return -EIO; }
 static inline int pci_assign_resource(struct pci_dev *dev, int i)
 { return -EBUSY; }
+static inline pci_bus_addr_t pci_bus_address(struct pci_dev *pdev, int bar)
+{ return 0; }
 static inline int __pci_register_driver(struct pci_driver *drv,
 					struct module *owner)
 { return 0; }
@@ -1756,6 +1760,15 @@ static inline int pci_find_ext_capability(struct pci_dev *dev, int cap)
 
 static inline u64 pci_get_dsn(struct pci_dev *dev)
 { return 0; }
+
+static inline int __printf(6, 7) pci_request_irq(struct pci_dev *dev,
+		unsigned int nr, irq_handler_t handler, irq_handler_t thread_fn,
+		void *dev_id, const char *fmt, ...)
+{ return -ENOSYS; }
+
+static inline void pci_free_irq(struct pci_dev *dev, unsigned int nr, void *dev_id)
+{
+}
 
 /* Power management related routines */
 static inline int pci_save_state(struct pci_dev *dev) { return 0; }
@@ -1825,6 +1838,15 @@ pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs,
 {
 	return -ENOSPC;
 }
+
+static inline void pci_free_irq_vectors(struct pci_dev *dev)
+{
+}
+
+static inline void pci_release_mem_regions(struct pci_dev *pdev)
+{
+}
+
 #endif /* CONFIG_PCI */
 
 static inline int
